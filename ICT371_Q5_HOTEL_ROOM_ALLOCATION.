@@ -1,0 +1,266 @@
+-- ICT371 Advanced Database - Question 5: Hostel Room Allocation
+
+-- ==== Setup ====
+-- Run top to bottom in psql / pgAdmin (PostgreSQL 11 or later).
+-- Scheduling in part (g) needs the pg_cron extension.
+DROP TABLE IF EXISTS occupancy_snapshot, allocations, rooms, students CASCADE;
+
+-- ==== (a) Database and seed data ====
+CREATE TABLE students (
+    student_id     SERIAL PRIMARY KEY,
+    student_number VARCHAR(20) NOT NULL UNIQUE,
+    full_name      VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE rooms (
+    room_id     SERIAL PRIMARY KEY,
+    room_number VARCHAR(10) NOT NULL UNIQUE,
+    capacity    INTEGER NOT NULL CHECK (capacity > 0)
+);
+
+CREATE TABLE allocations (
+    allocation_id SERIAL PRIMARY KEY,
+    student_id    INTEGER NOT NULL REFERENCES students(student_id),
+    room_id       INTEGER NOT NULL REFERENCES rooms(room_id),
+    allocated_on  DATE NOT NULL,
+    released_on   DATE,
+    status        VARCHAR(10) NOT NULL,
+    CONSTRAINT chk_status CHECK (status IN ('ACTIVE', 'ENDED')),
+    CONSTRAINT chk_release CHECK (
+        (status = 'ACTIVE' AND released_on IS NULL)
+        OR
+        (status = 'ENDED' AND released_on IS NOT NULL AND released_on >= allocated_on)
+    )
+);
+
+CREATE TABLE occupancy_snapshot (
+    snapshot_date DATE NOT NULL,
+    room_id       INTEGER NOT NULL REFERENCES rooms(room_id),
+    occupied_beds INTEGER NOT NULL,
+    free_beds     INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_date, room_id)
+);
+
+INSERT INTO rooms (room_number, capacity) VALUES
+    ('R101', 2),    -- will be full
+    ('R102', 3),    -- will be partly occupied
+    ('R103', 2);    -- will be empty (history only)
+
+INSERT INTO students (student_number, full_name) VALUES
+    ('S001', 'Alice Mwansa'),
+    ('S002', 'Brian Phiri'),
+    ('S003', 'Chanda Banda'),
+    ('S004', 'Daliso Mvula'),
+    ('S005', 'Esther Zulu'),
+    ('S006', 'Felix Tembo');
+
+-- The allocation rows are inserted at the end of part (d), after the
+-- capacity trigger exists, so the seed data is checked by the same rules.
+
+-- ==== (b) Function: fn_free_beds ====
+CREATE OR REPLACE FUNCTION fn_free_beds(p_room_id INTEGER)
+RETURNS INTEGER AS $$
+DECLARE
+    v_capacity INTEGER;
+    v_active   INTEGER;
+BEGIN
+    SELECT capacity INTO v_capacity
+    FROM rooms
+    WHERE room_id = p_room_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown room: %', p_room_id;
+    END IF;
+
+    -- Only ACTIVE allocations occupy beds; ENDED ones are ignored
+    SELECT COUNT(*) INTO v_active
+    FROM allocations
+    WHERE room_id = p_room_id
+      AND status = 'ACTIVE';
+
+    RETURN v_capacity - v_active;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ==== (c) Procedure: pr_allocate_room ====
+CREATE OR REPLACE PROCEDURE pr_allocate_room(
+    p_student_id INTEGER, p_room_id INTEGER, p_allocated_on DATE)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM students WHERE student_id = p_student_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown student: %', p_student_id;
+    END IF;
+
+    -- Lock the room row so two allocations cannot take the last bed together
+    PERFORM 1 FROM rooms WHERE room_id = p_room_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown room: %', p_room_id;
+    END IF;
+
+    IF p_allocated_on IS NULL THEN
+        RAISE EXCEPTION 'Allocation date must not be NULL';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM allocations
+               WHERE student_id = p_student_id AND status = 'ACTIVE') THEN
+        RAISE EXCEPTION 'Student % already has an ACTIVE allocation', p_student_id;
+    END IF;
+
+    IF fn_free_beds(p_room_id) <= 0 THEN
+        RAISE EXCEPTION 'Room % is full', p_room_id;
+    END IF;
+
+    INSERT INTO allocations (student_id, room_id, allocated_on, released_on, status)
+    VALUES (p_student_id, p_room_id, p_allocated_on, NULL, 'ACTIVE');
+END;
+$$;
+
+-- ==== (d) Trigger: capacity and one ACTIVE allocation per student ====
+CREATE OR REPLACE FUNCTION trg_fn_check_allocation() RETURNS TRIGGER AS $$
+DECLARE
+    v_capacity INTEGER;
+    v_occupied INTEGER;
+BEGIN
+    IF NEW.status = 'ACTIVE' THEN
+        -- One ACTIVE allocation per student (exclude the row being updated)
+        IF EXISTS (
+            SELECT 1 FROM allocations a
+            WHERE a.student_id = NEW.student_id
+              AND a.status = 'ACTIVE'
+              AND (TG_OP = 'INSERT' OR a.allocation_id <> NEW.allocation_id)
+        ) THEN
+            RAISE EXCEPTION 'Student % already has an ACTIVE allocation', NEW.student_id;
+        END IF;
+
+        -- Lock the room row to serialise capacity checks on the same room
+        SELECT capacity INTO v_capacity
+        FROM rooms
+        WHERE room_id = NEW.room_id
+        FOR UPDATE;
+
+        SELECT COUNT(*) INTO v_occupied
+        FROM allocations a
+        WHERE a.room_id = NEW.room_id
+          AND a.status = 'ACTIVE'
+          AND (TG_OP = 'INSERT' OR a.allocation_id <> NEW.allocation_id);
+
+        IF v_occupied >= v_capacity THEN
+            RAISE EXCEPTION 'Room % is at capacity (%)', NEW.room_id, v_capacity;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_check_allocation
+BEFORE INSERT OR UPDATE ON allocations
+FOR EACH ROW
+EXECUTE FUNCTION trg_fn_check_allocation();
+
+-- Seed: full (R101), partly occupied (R102), empty (R103)
+INSERT INTO allocations (student_id, room_id, allocated_on, released_on, status) VALUES
+    (1, 1, CURRENT_DATE - 60, NULL,             'ACTIVE'),
+    (2, 1, CURRENT_DATE - 55, NULL,             'ACTIVE'),   -- R101 full
+    (3, 2, CURRENT_DATE - 40, NULL,             'ACTIVE'),   -- R102 1 of 3
+    (4, 2, CURRENT_DATE - 90, CURRENT_DATE - 30, 'ENDED'),   -- history only
+    (5, 3, CURRENT_DATE - 80, CURRENT_DATE - 20, 'ENDED');   -- R103 empty
+
+SELECT fn_free_beds(1);   -- 0
+SELECT fn_free_beds(2);   -- 2 (the ENDED row does not reduce availability)
+SELECT fn_free_beds(3);   -- 2
+
+-- Tests
+CALL pr_allocate_room(6, 2, CURRENT_DATE);                  -- valid
+-- CALL pr_allocate_room(6, 3, CURRENT_DATE);               -- error: already ACTIVE
+-- CALL pr_allocate_room(5, 1, CURRENT_DATE);               -- error: room full
+-- INSERT INTO allocations (student_id, room_id, allocated_on, status)
+-- VALUES (5, 1, CURRENT_DATE, 'ACTIVE');                   -- error: trigger (full)
+
+-- ==== (e) View: v_room_occupancy ====
+CREATE OR REPLACE VIEW v_room_occupancy AS
+SELECT r.room_id,
+       r.room_number,
+       r.capacity,
+       COUNT(a.allocation_id)              AS occupied_beds,
+       r.capacity - COUNT(a.allocation_id) AS free_beds
+FROM rooms r
+LEFT JOIN allocations a
+       ON a.room_id = r.room_id
+      AND a.status = 'ACTIVE'              -- filter in ON so empty rooms still appear
+GROUP BY r.room_id, r.room_number, r.capacity;
+
+SELECT * FROM v_room_occupancy ORDER BY room_number;
+
+-- ==== (f) Index ====
+-- Justification: occupancy checks count ACTIVE allocations for one room. A
+-- partial index on room_id covering only ACTIVE rows is small (ENDED history is
+-- left out) and exactly matches the query used by the function, view and trigger.
+CREATE INDEX idx_alloc_active_room
+ON allocations (room_id)
+WHERE status = 'ACTIVE';
+ANALYZE allocations;
+
+SET enable_seqscan = off;   -- demo only: tiny tables would otherwise use a seq scan
+EXPLAIN
+SELECT allocation_id, student_id
+FROM allocations
+WHERE room_id = 1
+  AND status = 'ACTIVE';
+RESET enable_seqscan;
+
+-- ==== (g) Scheduled job: pr_refresh_occupancy ====
+CREATE OR REPLACE PROCEDURE pr_refresh_occupancy()
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- One row per date and room; a rerun overwrites the values
+    INSERT INTO occupancy_snapshot (snapshot_date, room_id, occupied_beds, free_beds)
+    SELECT CURRENT_DATE,
+           r.room_id,
+           COUNT(a.allocation_id)::INTEGER,
+           (r.capacity - COUNT(a.allocation_id))::INTEGER
+    FROM rooms r
+    LEFT JOIN allocations a
+           ON a.room_id = r.room_id
+          AND a.status = 'ACTIVE'
+    GROUP BY r.room_id, r.capacity
+    ON CONFLICT (snapshot_date, room_id) DO UPDATE
+    SET occupied_beds = EXCLUDED.occupied_beds,
+        free_beds     = EXCLUDED.free_beds;
+END;
+$$;
+
+CALL pr_refresh_occupancy();
+CALL pr_refresh_occupancy();                       -- rerun replaces, no duplicates
+SELECT * FROM occupancy_snapshot ORDER BY room_id;
+
+-- Schedule daily at 23:55 (pg_cron)
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+SELECT cron.schedule(
+    'refresh_occupancy_daily',
+    '55 23 * * *',
+    $$CALL pr_refresh_occupancy()$$
+);
+SELECT jobid, jobname, schedule, command FROM cron.job;
+ AS $$
+BEGIN
+    -- One row per date and room; a rerun overwrites the values
+    INSERT INTO occupancy_snapshot (snapshot_date, room_id, occupied_beds, free_beds)
+    SELECT CURRENT_DATE,
+           r.room_id,
+           COUNT(a.allocation_id)::INTEGER,
+           (r.capacity - COUNT(a.allocation_id))::INTEGER
+    FROM rooms r
+    LEFT JOIN allocations a
+           ON a.room_id = r.room_id
+          AND a.status = 'ACTIVE'
+    GROUP BY r.room_id, r.capacity
+    ON CONFLICT (snapshot_date, room_id) DO UPDATE
+    SET occupied_beds = EXCLUDED.occupied_beds,
+        free_beds     = EXCLUDED.free_beds;
+END;
+$$;
+
+CALL pr_refresh_occupancy();
+CALL pr_refresh_occupancy();                       -- rerun replaces, no duplicates
+SELECT * FROM occupancy_snapshot OR
